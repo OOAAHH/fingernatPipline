@@ -1,0 +1,2099 @@
+#!/usr/bin/env python3
+"""End-to-end pipeline to prepare RNA-ligand models and run fingeRNAt analyses.
+
+Steps:
+1. Pre-process PDB submissions (split into individual models/modules and separate ligands).
+2. Convert ligand fragments to SDF, keep RNA chains as PDB.
+3. Run fingeRNAt for each RNA/ligand pair.
+4. Aggregate run metadata and discovered issues into a summary table.
+
+This version uses a manual ligand selection file (CSV) instead of CCD/heuristics:
+- Residue groups matching any provided label are considered ligands.
+- ATOM records not labeled as ligands are written to RNA (polymer).
+- Unlabeled HETATM records are ignored (no others.pdb output).
+
+Typical usage (inside the docker/conda environment that contains fingeRNAt and OpenBabel):
+
+    python bin/fingeRNAt/run_fingernaat_pipeline.py \
+        --root 99_emailExtrctPZfiles \
+        --puzzles PZ43 PZ47 PZ49 \
+        --ligand-csv path/to/ligands.csv \
+        --fingernaat-script /path/to/fingeRNAt.py \
+        --python-exec python \
+        --output-root fingernaat_pipeline_outputs
+
+Use --steps to run a subset of stages (prep, run, summarize)."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Set
+
+try:
+    from openbabel import pybel  # type: ignore
+except ImportError:  # pragma: no cover - handled at runtime
+    pybel = None
+
+# Optional dependencies for final alignment step
+try:  # pragma: no cover - runtime environment dependent
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover
+    np = None  # type: ignore
+
+try:  # pragma: no cover - runtime environment dependent
+    from Bio.PDB import Superimposer  # type: ignore
+except Exception:  # pragma: no cover
+    Superimposer = None  # type: ignore
+
+# Repo root for locating helper scripts
+SCRIPT_ROOT = Path(__file__).resolve().parents[2]
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+
+from bin.fingeRNAt import tsv_to_excel
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ResidueGroup:
+    """Container to hold lines and metadata for a residue within a model."""
+
+    model_id: int
+    model_tag: str
+    resname: str
+    chain: str
+    resseq: Optional[int]
+    icode: str
+    occurrence: int
+    lines: List[str] = field(default_factory=list)
+    info: Optional[Dict[str, object]] = None
+    has_atom: bool = False
+    has_hetatm: bool = False
+
+    @property
+    def key(self) -> Tuple[int, str, str, Optional[int], str, int]:
+        return (self.model_id, self.resname, self.chain, self.resseq, self.icode, self.occurrence)
+
+    @property
+    def is_polymer(self) -> bool:
+        # In manual mode, treat groups with ATOM-only as polymer by default
+        return self.has_atom and not self.has_hetatm
+
+    @property
+    def category(self) -> str:
+        # Category is determined at write time based on label matching.
+        return "unknown"
+
+    @property
+    def suspect(self) -> bool:
+        # No suspect detection in manual mode
+        return False
+
+
+@dataclass
+class ModelBundle:
+    """Container for a single model/module extracted from a PDB file."""
+
+    model_id: int
+    model_tag: str
+    header: List[str]
+    body_lines: List[str]
+    groups: Dict[Tuple[int, str, str, Optional[int], str, int], ResidueGroup]
+
+    def write_model_pdb(self, dest: Path) -> None:
+        with dest.open("w") as fh:
+            fh.writelines(self.header)
+            if not self.body_lines or not self.body_lines[0].startswith("MODEL"):
+                fh.write(f"MODEL        {self.model_id}\n")
+            fh.writelines(self.body_lines)
+            if not any(line.startswith("ENDMDL") for line in self.body_lines):
+                fh.write("ENDMDL\n")
+
+
+@dataclass
+class LigandArtifact:
+    """Represents a prepared ligand ready for fingeRNAt evaluation."""
+
+    residue: ResidueGroup
+    output_dir: Path
+    metadata: Dict[str, object]
+
+    @property
+    def sdf_path(self) -> Path:
+        return self.output_dir / "ligand.sdf"
+
+    @property
+    def pdb_path(self) -> Path:
+        return self.output_dir / "ligand.pdb"
+
+    @property
+    def status_path(self) -> Path:
+        return self.output_dir / "fingernaat_status.json"
+
+
+@dataclass
+class PipelineConfig:
+    root: Path
+    puzzles: List[str]
+    fingernaat_script: Path
+    python_exec: str
+    output_root: Path
+    steps: List[str]
+    overwrite: bool = False
+    dry_run: bool = False
+    ligand_csv: Optional[Path] = None  # CSV mapping: puzzle,label
+    make_heatmaps: bool = True  # Produce per‑puzzle TSV + heatmaps after summarize
+    solutions_root: Optional[Path] = None  # Root containing solution PZxx folders with split.txt
+    max_models: int = 5  # Limit number of models split per file (0 = no limit)
+    fingernaat_detail: bool = False  # Pass -detail to fingeRNAt to emit DETAIL_*.tsv
+
+
+class FingernaatPipeline:
+    def __init__(self, cfg: PipelineConfig) -> None:
+        self.cfg = cfg
+        # Load ligand labels per puzzle
+        self.label_index: Dict[str, List[Tuple[str, Optional[str], Optional[int], Optional[str]]]] = {}
+        if cfg.ligand_csv:
+            try:
+                self.label_index = self._load_ligand_csv(cfg.ligand_csv)
+                logger.info("Loaded ligand labels for %d puzzles from %s", len(self.label_index), cfg.ligand_csv)
+            except Exception as exc:
+                logger.exception("Failed to load ligand CSV %s: %s", cfg.ligand_csv, exc)
+        # Track solution stems per puzzle for later prioritization in outputs
+        self.solution_stems: Dict[str, Set[str]] = defaultdict(set)
+
+    # ------------------------------------------------------------------
+    # Orchestration
+    # ------------------------------------------------------------------
+    def run(self) -> None:
+        steps = [s.lower() for s in self.cfg.steps]
+        if "prep" in steps:
+            self.prepare_inputs()
+        if "prep_solution" in steps:
+            self.prepare_solutions()
+        if "run" in steps:
+            self.execute_fingernaat()
+        if "summarize" in steps:
+            self.aggregate_results()
+        # Finalize outputs: rename full-model files per new contract and align predictions to first solution
+        if "finalize" in steps:
+            self.finalize_outputs()
+
+    # ------------------------------------------------------------------
+    # Step 1: preparation
+    # ------------------------------------------------------------------
+    def prepare_inputs(self) -> None:
+        logger.info("Preparing inputs for puzzles: %s", ", ".join(self.cfg.puzzles))
+        # When using the curated repository layout, PZxx step2 folders live under
+        # SCRIPT_ROOT / "Puzzles" / PZxx / "step2".  For historical runs that used
+        # extracted email dumps (e.g. 99_emailExtrctPZfiles), we keep the original
+        # behaviour of reading directly from cfg.root / puzzle.
+        for puzzle in self.cfg.puzzles:
+            puzzle_dir = self.cfg.root / puzzle
+            group_from_filename = False
+
+            # Special-case: root points to Puzzles/original → read from Puzzles/PZxx/step2
+            # This keeps CLI unchanged (still pass --root Puzzles/original) while
+            # using the normalized step2 submissions for predictions.
+            if self.cfg.root.name == "original":
+                step2_dir = SCRIPT_ROOT / "Puzzles" / puzzle / "step2"
+                if step2_dir.is_dir():
+                    logger.info("Using step2 directory for %s: %s", puzzle, step2_dir)
+                    puzzle_dir = step2_dir
+                    group_from_filename = True
+
+            if not puzzle_dir.is_dir():
+                logger.warning("Puzzle directory not found: %s", puzzle_dir)
+                continue
+            if not self.label_index.get(puzzle):
+                logger.warning("No ligand labels provided for %s; only ATOM records will be written to RNA, HETATM to others.", puzzle)
+            for pdb_path in sorted(puzzle_dir.glob("*.pdb")):
+                try:
+                    self._process_single_pdb(puzzle, pdb_path, group_from_filename=group_from_filename)
+                except Exception as exc:  # pragma: no cover - diagnostics only
+                    logger.exception("Failed to process %s: %s", pdb_path, exc)
+
+    # ------------------------------------------------------------------
+    # Step 1b: preparation for solutions
+    # ------------------------------------------------------------------
+    def prepare_solutions(self) -> None:
+        if not self.cfg.solutions_root:
+            logger.warning("prep_solution requested but --solutions-root not provided")
+            return
+        logger.info("Preparing solutions for puzzles: %s", ", ".join(self.cfg.puzzles))
+        for puzzle in self.cfg.puzzles:
+            pdir = self.cfg.solutions_root / puzzle
+            if not pdir.is_dir():
+                logger.warning("Solutions directory not found: %s", pdir)
+                continue
+            split_file = pdir / "split.txt"
+            if not split_file.exists():
+                logger.warning("split.txt not found in %s; skipping", pdir)
+                continue
+            try:
+                lines = [ln.strip() for ln in split_file.read_text().splitlines() if ln.strip()]
+            except Exception as exc:
+                logger.warning("Failed to read %s: %s", split_file, exc)
+                continue
+            # each line: <stem> <tab/space> ... ; use first token as stem
+            for ln in lines:
+                # accept comma/space/tab separated, use first field
+                if "\t" in ln:
+                    stem = ln.split("\t", 1)[0].strip()
+                elif "," in ln:
+                    stem = ln.split(",", 1)[0].strip()
+                else:
+                    stem = ln.split()[0]
+                if not stem:
+                    continue
+                pdb_path = pdir / f"{stem}.pdb"
+                if not pdb_path.exists():
+                    logger.error("Solution PDB not found for stem %s in %s (expecting %s)", stem, pdir, f"{stem}.pdb")
+                    raise SystemExit(f"Missing solution PDB for {puzzle}: {pdb_path}")
+                # record stem(s) for prioritization in summarize
+                self.solution_stems[puzzle].add(stem)
+                try:
+                    self.solution_stems[puzzle].add(pdb_path.stem)
+                except Exception:
+                    pass
+                try:
+                    self._process_single_pdb(puzzle, pdb_path)
+                except Exception as exc:  # pragma: no cover - diagnostics only
+                    logger.exception("Failed to process solution %s: %s", pdb_path, exc)
+
+    def _process_single_pdb(self, puzzle: str, pdb_path: Path, *, group_from_filename: bool = False) -> None:
+        logger.info("Processing %s", pdb_path)
+        bundles = self._split_pdb_into_models(pdb_path)
+        if not bundles:
+            logger.warning("No models extracted from %s", pdb_path)
+            return
+
+        stem = pdb_path.stem
+        # For normalized step2 inputs, group outputs by submitter name (middle
+        # token in PZxx_name_index.pdb), so that all indices of the same
+        # submitter share one folder (e.g. PZ4_Adamiak_1–5 → Adamiak/model_01–05).
+        submitter_name = stem
+        index_override: Optional[int] = None
+        if group_from_filename:
+            submitter_name, index_override = self._parse_step2_stem(puzzle, stem)
+
+        # 对于来自邮件或原始 PDB 的文件，若存在 Puzzles/list/PZxx.list，
+        # 则优先使用 list 中定义的短名作为外层目录名，以统一对外展示。
+        try:
+            from bin.fingeRNAt.export_heatmap_tsv import _SHORT_NAME_MAP  # type: ignore
+        except Exception:
+            _SHORT_NAME_MAP = {}  # type: ignore
+        try:
+            if puzzle not in _SHORT_NAME_MAP:
+                lst = SCRIPT_ROOT / "Puzzles" / "list" / f"{puzzle}.list"
+                if not lst.exists():
+                    raise RuntimeError(f"Short-name list file not found for puzzle {puzzle}: {lst}")
+                mapping: Dict[str, str] = {}
+                for raw in lst.read_text().splitlines():
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    fname, short = parts[0].strip(), parts[1].strip()
+                    if not fname or not short:
+                        continue
+                    from pathlib import Path as _P
+                    mapping[fname] = short
+                    mapping[_P(fname).name] = short
+                    mapping[_P(fname).stem] = short
+                _SHORT_NAME_MAP[puzzle] = mapping
+            mapping = _SHORT_NAME_MAP[puzzle]
+            # 使用原始 PDB 文件名进行映射；若找不到映射，则保持现有 submitter_name。
+            src_name = pdb_path.name
+            short = mapping.get(src_name) or mapping.get(pdb_path.stem)
+            if short:
+                submitter_name = short
+        except Exception as exc:
+            logger.error("Failed to apply short-name mapping for %s: %s", puzzle, exc)
+            raise
+
+        file_output_root = self.cfg.output_root / puzzle / submitter_name
+        file_output_root.mkdir(parents=True, exist_ok=True)
+
+        for bundle in bundles:
+            # Optionally override model id using the numeric index encoded in
+            # the filename (PZxx_name_index) so that different files for the
+            # same submitter map to model_01, model_02, … within one folder.
+            model_id = bundle.model_id
+            if group_from_filename and index_override is not None:
+                model_id = index_override
+                if bundle.model_id != model_id:
+                    bundle.model_id = model_id
+                    # Keep residue group metadata consistent with the new id
+                    for g in bundle.groups.values():
+                        g.model_id = model_id
+
+            model_dir = file_output_root / f"model_{model_id:02d}"
+            if model_dir.exists() and not self.cfg.overwrite:
+                logger.info("Model directory %s exists; skipping (use --overwrite to regen)", model_dir)
+                continue
+            self._write_model_bundle(bundle, model_dir, puzzle, pdb_path)
+
+        # Cleanup: remove file root dir if all models got pruned
+        try:
+            if file_output_root.exists() and not any(file_output_root.iterdir()):
+                file_output_root.rmdir()
+                logger.info("Removed empty output folder for %s", pdb_path.stem)
+        except Exception as exc:
+            logger.warning("Failed to remove empty folder %s: %s", file_output_root, exc)
+
+    def _write_model_bundle(self, bundle: ModelBundle, model_dir: Path,
+                             puzzle: str, pdb_path: Path) -> None:
+        if self.cfg.dry_run:
+            logger.info("Dry-run: would write model bundle to %s", model_dir)
+            return
+
+        # Output slimming: if no ligand matched by CSV and no HETATM present in model, skip outputs entirely
+        labels = self.label_index.get(puzzle, [])
+        has_any_hetatm = any(g.has_hetatm for g in bundle.groups.values())
+        has_any_matched = any(self._match_group_with_labels(g, labels) for g in bundle.groups.values())
+        if not has_any_matched and not has_any_hetatm:
+            logger.info("Skip model %s (no ligand matched and no HETATM)", model_dir)
+            return
+
+        if model_dir.exists():
+            for item in model_dir.iterdir():
+                if item.is_file():
+                    item.unlink()
+                else:
+                    shutil.rmtree(item)
+        else:
+            model_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write full model PDB
+        bundle.write_model_pdb(model_dir / "model_full.pdb")
+
+        # Separate RNA (polymer)
+        rna_lines: List[str] = []
+        ligand_artifacts: List[LigandArtifact] = []
+        suspect_groups: List[ResidueGroup] = []
+
+        for group in bundle.groups.values():
+            matched = self._match_group_with_labels(group, labels)
+            if matched:
+                ligand_dir = model_dir / self._ligand_dir_name(group)
+                ligand_dir.mkdir(exist_ok=True)
+                if not group.lines:
+                    logger.warning("No lines captured for %s", group.key)
+                    continue
+                self._write_ligand_files(group, ligand_dir)
+                metadata = self._build_ligand_metadata(group, puzzle, pdb_path)
+                (ligand_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+                ligand_artifacts.append(LigandArtifact(group, ligand_dir, metadata))
+            else:
+                if group.has_atom:
+                    rna_lines.extend([ln for ln in group.lines if ln.startswith("ATOM")])
+                # Unmatched HETATM are ignored to enforce 1:1 evaluation (no others.pdb)
+
+            if group.suspect:
+                suspect_groups.append(group)
+
+        # Write RNA-only PDB (if there were polymer atoms)
+        if rna_lines:
+            with (model_dir / "rna.pdb").open("w") as fh:
+                fh.write(f"MODEL        {bundle.model_id}\n")
+                fh.writelines(rna_lines)
+                fh.write("ENDMDL\n")
+        else:
+            logger.warning("No polymer atoms detected for %s model %d", pdb_path.name, bundle.model_id)
+
+        # Persist model-level metadata
+        model_meta = {
+            "puzzle": puzzle,
+            "source_pdb": pdb_path.name,
+            "model_id": bundle.model_id,
+            "model_tag": bundle.model_tag,
+            "ligand_count": len(ligand_artifacts),
+            "suspect_groups": [self._residue_summary(g) for g in suspect_groups],
+        }
+        (model_dir / "model_metadata.json").write_text(json.dumps(model_meta, indent=2))
+
+        # Remove model directory if no ligand outputs (tidy up)
+        if len(ligand_artifacts) == 0:
+            try:
+                shutil.rmtree(model_dir)
+                logger.info("Removed empty model directory without ligands: %s", model_dir)
+            except Exception as exc:
+                logger.warning("Failed to remove empty model directory %s: %s", model_dir, exc)
+
+    def _ligand_dir_name(self, group: ResidueGroup) -> str:
+        parts = ["ligand", group.resname or "UNK"]
+        parts.append(group.chain or "_")
+        if group.resseq is not None:
+            parts.append(str(group.resseq))
+        if group.icode:
+            parts.append(group.icode)
+        parts.append(f"occ{group.occurrence}")
+        return "_".join(parts)
+
+    def _write_ligand_files(self, group: ResidueGroup, ligand_dir: Path) -> None:
+        ligand_pdb = ligand_dir / "ligand.pdb"
+        het_lines = [ln for ln in group.lines if ln.startswith("HETATM")]
+        src_lines = het_lines if het_lines else group.lines
+        ligand_pdb.write_text("".join(src_lines) + "END\n")
+
+        if pybel is None:  # pragma: no cover
+            logger.error("OpenBabel pybel not available; cannot create SDF for %s", ligand_dir)
+            return
+        try:
+            mol = pybel.readstring("pdb", "".join(src_lines))
+            mol.write("sdf", str(ligand_dir / "ligand.sdf"), overwrite=True)
+        except Exception as exc:  # pragma: no cover
+            logger.error("Failed to convert ligand to SDF in %s: %s", ligand_dir, exc)
+
+    def _build_ligand_metadata(self, group: ResidueGroup, puzzle: str, pdb_path: Path) -> Dict[str, object]:
+        metadata = {
+            "puzzle": puzzle,
+            "source_pdb": pdb_path.name,
+            "model_id": group.model_id,
+            "model_tag": group.model_tag,
+            "resname": group.resname,
+            "chain": group.chain,
+            "resseq": group.resseq,
+            "icode": group.icode,
+            "occurrence": group.occurrence,
+            "category": "ligand",
+            "source_lines": len(group.lines),
+        }
+        return metadata
+
+    # ------------------------------------------------------------------
+    # Step 2: run fingeRNAt
+    # ------------------------------------------------------------------
+    def execute_fingernaat(self) -> None:
+        logger.info("Running fingeRNAt on prepared inputs")
+        for ligand_metadata in self._iter_ligand_artifacts():
+            self._run_fingernaat_for_ligand(ligand_metadata)
+
+    def _run_fingernaat_for_ligand(self, artifact: LigandArtifact) -> None:
+        meta = artifact.metadata
+        ligand_dir = artifact.output_dir
+        status_path = artifact.status_path
+
+        if status_path.exists() and not self.cfg.overwrite:
+            logger.info("Skipping existing fingeRNAt run for %s", ligand_dir)
+            return
+
+        # Use absolute paths to avoid resolution issues with relative CWDs
+        rna_path = (ligand_dir.parent / "rna.pdb").resolve()
+        lig_path = artifact.sdf_path.resolve()
+        script_path = self.cfg.fingernaat_script.resolve() if not self.cfg.fingernaat_script.is_absolute() else self.cfg.fingernaat_script
+
+        if not rna_path.exists():
+            logger.error("RNA file missing for %s; skipping", ligand_dir)
+            status = {"error": "rna_missing", "rna": str(rna_path)}
+            artifact.status_path.write_text(json.dumps(status, indent=2))
+            return
+        if not lig_path.exists():
+            logger.error("Ligand SDF missing for %s; skipping", ligand_dir)
+            status = {"error": "sdf_missing", "sdf": str(lig_path)}
+            artifact.status_path.write_text(json.dumps(status, indent=2))
+            return
+
+        cmd = [self.cfg.python_exec, str(script_path), "-r", str(rna_path), "-l", str(lig_path)]
+        if self.cfg.fingernaat_detail:
+            cmd.append('-detail')
+        logger.info("Running fingeRNAt: %s", " ".join(cmd))
+
+        if self.cfg.dry_run:
+            logger.info("Dry-run: would execute fingeRNAt for %s", ligand_dir)
+            return
+
+        run_dir = ligand_dir / "fingernaat"
+        run_dir.mkdir(exist_ok=True)
+        result = subprocess.run(cmd, cwd=run_dir, capture_output=True, text=True)
+
+        status = {
+            "command": cmd,
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+        status_path.write_text(json.dumps(status, indent=2))
+        if result.returncode != 0:
+            logger.error("fingeRNAt failed for %s (code %s)", ligand_dir, result.returncode)
+        else:
+            logger.info("fingeRNAt completed for %s", ligand_dir)
+
+    def _iter_ligand_artifacts(self) -> Iterable[LigandArtifact]:
+        for puzzle_dir in (self.cfg.output_root / puzzle for puzzle in self.cfg.puzzles):
+            if not puzzle_dir.exists():
+                continue
+            for file_dir in puzzle_dir.iterdir():
+                if not file_dir.is_dir():
+                    continue
+                for model_dir in sorted(file_dir.glob("model_*")):
+                    for ligand_dir in sorted(model_dir.glob("ligand_*")):
+                        meta_path = ligand_dir / "metadata.json"
+                        if not meta_path.exists():
+                            continue
+                        metadata = json.loads(meta_path.read_text())
+                        group = ResidueGroup(
+                            model_id=int(metadata.get("model_id", 1)),
+                            model_tag=str(metadata.get("model_tag", "MODEL")),
+                            resname=str(metadata.get("resname", "")),
+                            chain=str(metadata.get("chain", "")),
+                            resseq=int(metadata["resseq"]) if metadata.get("resseq") not in (None, "") else None,
+                            icode=str(metadata.get("icode", "")),
+                            occurrence=int(metadata.get("occurrence", 1)),
+                            lines=[]
+                        )
+                        yield LigandArtifact(group, ligand_dir, metadata)
+
+    # ------------------------------------------------------------------
+    # Step 3: aggregation
+    # ------------------------------------------------------------------
+    def aggregate_results(self) -> None:
+        logger.info("Aggregating fingeRNAt results")
+
+        # Ensure solution stems are available for all puzzles so that
+        # is_solution flags and downstream canonical pocket exports are
+        # correctly populated, even if this run did not execute
+        # prepare_solutions().
+        if self.cfg.solutions_root:
+            for puzzle in self.cfg.puzzles:
+                if not self.solution_stems.get(puzzle):
+                    try:
+                        stems = self._ordered_solution_stems(puzzle)
+                    except Exception:
+                        stems = []
+                    for st in stems:
+                        self.solution_stems[puzzle].add(st)
+
+        rows: List[Dict[str, object]] = []
+        per_puzzle_interactions: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+        for artifact in self._iter_ligand_artifacts():
+            meta = artifact.metadata
+            row = meta.copy()
+            # add ligand folder name for clearer identification
+            row["ligand_dirname"] = artifact.output_dir.name
+            # mark solution flag for runs sheet
+            try:
+                sol_stems = self.solution_stems.get(str(meta.get("puzzle")), set())
+                row["is_solution"] = 1 if Path(str(meta.get("source_pdb", ""))).stem in sol_stems else 0
+            except Exception:
+                row["is_solution"] = 0
+            status_path = artifact.status_path
+            if status_path.exists():
+                status = json.loads(status_path.read_text())
+                row["fingernaat_returncode"] = status.get("returncode")
+                row["fingernaat_stdout"] = status.get("stdout", "")
+                row["fingernaat_stderr"] = status.get("stderr", "")
+            else:
+                row["fingernaat_returncode"] = None
+
+            outputs = []
+            run_dir = artifact.output_dir / "fingernaat"
+            if run_dir.exists():
+                for tsv in run_dir.glob("*.tsv"):
+                    outputs.append(str(tsv))
+                for csv_file in run_dir.glob("*.csv"):
+                    outputs.append(str(csv_file))
+                # also collect outputs from subfolder 'outputs'
+                out_sub = run_dir / "outputs"
+                if out_sub.exists():
+                    for tsv in out_sub.glob("*.tsv"):
+                        outputs.append(str(tsv))
+                        # Only aggregate *_FULL.tsv into interactions
+                        if tsv.name.endswith('_FULL.tsv'):
+                            try:
+                                interactions = self._read_tsv_rows(tsv)
+                                # enrich with metadata columns
+                                for r in interactions:
+                                    r["puzzle"] = meta.get("puzzle")
+                                    r["source_pdb"] = meta.get("source_pdb")
+                                    r["model_id"] = meta.get("model_id")
+                                    # r["model_tag"] intentionally omitted from interactions sheet
+                                    r["resname"] = meta.get("resname")
+                                    # r["chain"] omitted per requirement
+                                    r["resseq"] = meta.get("resseq")
+                                    r["icode"] = meta.get("icode")
+                                    # r["occurrence"] omitted per requirement
+                                    # record ligand folder name for clear disambiguation
+                                    r["ligand_dirname"] = artifact.output_dir.name
+                                    # r["output_file"] omitted per requirement
+                                    try:
+                                        sol_stems = self.solution_stems.get(str(meta.get("puzzle")), set())
+                                        r["is_solution"] = 1 if Path(str(meta.get("source_pdb", ""))).stem in sol_stems else 0
+                                    except Exception:
+                                        r["is_solution"] = 0
+                                per_puzzle_interactions[str(meta.get("puzzle"))].extend(interactions)
+                            except Exception as exc:
+                                logger.warning("Failed to parse interactions from %s: %s", tsv, exc)
+            row["fingernaat_outputs"] = "|".join(outputs)
+            rows.append(row)
+
+        if not rows:
+            logger.warning("No ligand metadata found; summary not created")
+            return
+
+        summary_path = self.cfg.output_root / "fingernaat_summary.csv"
+        fieldnames = sorted({key for row in rows for key in row.keys()})
+        with summary_path.open("w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+        logger.info("Summary written to %s (%d rows)", summary_path, len(rows))
+
+        # Write per-puzzle Excel workbooks aggregating interaction rows
+        try:
+            from openpyxl import Workbook
+        except Exception as exc:
+            logger.warning("openpyxl not available (%s); skipping per-puzzle Excel aggregation", exc)
+            return
+
+        for puzzle, irows in per_puzzle_interactions.items():
+            if not irows:
+                continue
+            # Reorder: solution rows first (by source_pdb stem)
+            sol_stems = self.solution_stems.get(puzzle, set())
+            if sol_stems:
+                def _is_sol(r: Dict[str, object]) -> int:
+                    src = str(r.get("source_pdb", ""))
+                    stem = Path(src).stem
+                    return 0 if stem in sol_stems else 1
+                irows.sort(key=_is_sol)
+            # Determine column set (drop some columns per requirement)
+            drop_cols = {"model_tag", "chain", "Ligand_name", "output_file", "occurrence"}
+            all_cols = {k for r in irows for k in r.keys() if k not in drop_cols}
+            # Preferred front columns to clearly indicate origin (curated)
+            front = [
+                "puzzle", "source_pdb", "model_id",
+                "ligand_dirname",
+                "resname", "resseq", "icode"
+            ]
+            # Keep only those that exist
+            front = [c for c in front if c in all_cols]
+            # Remaining columns keep original sorted order excluding the front ones
+            rest = sorted([c for c in all_cols if c not in front])
+            icolumns = front + rest
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "interactions"
+            ws.append(icolumns)
+            for r in irows:
+                ws.append([r.get(c, "") for c in icolumns])
+
+            # Add runs sheet filtered by puzzle
+            ws2 = wb.create_sheet("runs")
+            ws2_cols = fieldnames
+            ws2.append(ws2_cols)
+            # Runs sheet rows for this puzzle, solution first
+            sol_stems = self.solution_stems.get(puzzle, set())
+            prows = [r for r in rows if str(r.get("puzzle")) == puzzle]
+            if sol_stems:
+                prows.sort(key=lambda r: 0 if Path(str(r.get("source_pdb", ""))).stem in sol_stems else 1)
+            for r in prows:
+                ws2.append([r.get(c, "") for c in ws2_cols])
+
+            # Add readme
+            ws3 = wb.create_sheet("readme")
+            ws3.append(["puzzle", puzzle])
+            ws3.append(["note", "interactions sheet aggregates all *_FULL.tsv rows for this puzzle, with metadata columns added."])
+
+            out_dir = self.cfg.output_root / puzzle
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_xlsx = out_dir / f"{puzzle}_fingernaat_results.xlsx"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            wb.save(out_xlsx)
+            logger.info("Wrote per-puzzle Excel %s with %d interaction rows", out_xlsx, len(irows))
+
+            # Optional: generate TSV + heatmaps per puzzle
+            if self.cfg.make_heatmaps and not self.cfg.dry_run:
+                try:
+                    exporter = SCRIPT_ROOT / 'bin' / 'fingeRNAt' / 'export_heatmap_tsv.py'
+                    regenerator = SCRIPT_ROOT / 'bin' / 'fingeRNAt' / 'regenerate_interaction_summary.py'
+                    tsv_out = out_dir / f"{puzzle}_fingernaat_summary_results.tsv"
+                    heat_dir = out_dir / 'heatmaps'
+                    heat_dir.mkdir(parents=True, exist_ok=True)
+                    # Export TSV
+                    cmd_exp = [self.cfg.python_exec, str(exporter), '--xlsx', str(out_xlsx.resolve()), '--sheet', 'interactions', '--out', str(tsv_out.resolve())]
+                    logger.info("Export TSV for heatmap: %s", ' '.join(cmd_exp))
+                    res_exp = subprocess.run(cmd_exp, capture_output=True, text=True)
+                    if res_exp.returncode != 0:
+                        logger.warning("TSV export failed (%s): %s", res_exp.returncode, res_exp.stderr)
+                    else:
+                        logger.info("TSV exported: %s", tsv_out)
+                        try:
+                            self._build_binding_pocket_fingerprints(tsv_out)
+                        except Exception as exc:
+                            logger.warning("Failed to build binding-pocket fingerprints for %s: %s", puzzle, exc)
+                    # Generate heatmaps
+                    cmd_heat = [self.cfg.python_exec, str(regenerator), '--input', str(tsv_out.resolve()), '--outdir', str(heat_dir.resolve())]
+                    logger.info("Generate heatmaps: %s", ' '.join(cmd_heat))
+                    res_heat = subprocess.run(cmd_heat, capture_output=True, text=True)
+                    if res_heat.returncode != 0:
+                        logger.warning("Heatmap generation failed (%s): %s", res_heat.returncode, res_heat.stderr)
+                    else:
+                        logger.info("Heatmaps written to %s", heat_dir)
+                except Exception as exc:
+                    logger.warning("Failed to generate heatmaps for %s: %s", puzzle, exc)
+
+    # ------------------------------------------------------------------
+    # Step 4: finalization (rename + alignment)
+    # ------------------------------------------------------------------
+    def finalize_outputs(self) -> None:
+        logger.info("Finalizing outputs: renaming full-model files and aligning predictions to reference solutions")
+        for puzzle in self.cfg.puzzles:
+            pdir = self.cfg.output_root / puzzle
+            if not pdir.is_dir():
+                logger.error("Puzzle outputs not found for %s", puzzle)
+                continue
+
+            # All solution stems for this puzzle (for naming)
+            sol_stems = set(self.solution_stems.get(puzzle, set()))
+
+            # Solutions in split.txt are ordered and define solution_i (i starts at 0)
+            ordered_sol_stems = self._ordered_solution_stems(puzzle)
+            if not ordered_sol_stems:
+                logger.error("No solution stems found for %s (split.txt missing or empty); cannot finalize outputs", puzzle)
+                continue
+
+            # Per‑solution residue ranges from split.txt (coords string, solution side)
+            coords_by_index = self._solution_coords_by_index(puzzle)
+
+            # Build reference RNA per solution index (solution_i): one rna.pdb per stem
+            ref_rna_by_index: Dict[int, Path] = {}
+            # Also keep solution index -> stem for logging/traceability
+            ref_stem_by_index: Dict[int, str] = {}
+            for idx, stem in enumerate(ordered_sol_stems):
+                ref_rna = self._find_ref_rna(pdir, stem)
+                if ref_rna is not None:
+                    ref_rna_by_index[idx] = ref_rna
+                    ref_stem_by_index[idx] = stem
+                else:
+                    logger.error("No reference RNA found under %s/%s; alignment for solution_%d disabled", puzzle, stem, idx)
+
+            if not ref_rna_by_index:
+                logger.error("No reference RNA available for %s; cannot finalize outputs", puzzle)
+                continue
+
+            # Per-puzzle alignment table: maps (submitter, model_index) -> solution_i
+            alignment_table = self._load_alignment_table(puzzle)
+            if not alignment_table:
+                logger.error("Alignment table not available or empty for %s; cannot finalize outputs", puzzle)
+                continue
+
+            for file_dir in sorted([d for d in pdir.iterdir() if d.is_dir()]):
+                stem = file_dir.name
+                for model_dir in sorted(file_dir.glob('model_*')):
+                    mid = self._parse_model_id_from_dir(model_dir.name)
+                    full_pdb = model_dir / 'model_full.pdb'
+                    if stem in sol_stems:
+                        # Solution: ensure naming is <stem>.pdb (no numbering) only for fresh outputs (no retro rename)
+                        dst = model_dir / f"{stem}.pdb"
+                        if full_pdb.exists():
+                            try:
+                                if dst.exists():
+                                    dst.unlink()
+                                shutil.move(str(full_pdb), str(dst))
+                                logger.info("Solution renamed: %s -> %s", 'model_full.pdb', dst.name)
+                            except Exception as exc:
+                                logger.warning("Failed to rename solution %s: %s", full_pdb, exc)
+                        # Nothing to do further for solutions in this model_dir
+                        continue
+
+                    # Prediction: align RNA to reference, apply to full, write <stem>_<model>.pdb
+                    dst = model_dir / f"{stem}_{mid:02d}.pdb"
+                    pred_rna = model_dir / 'rna.pdb'
+                    # Per-model mapping from Puzzles/table/PZxx.csv is mandatory
+                    sol_idx = alignment_table.get((stem, mid))
+                    if sol_idx is None:
+                        logger.error("No solution index mapping for %s model %d in %s; skipping alignment", stem, mid, puzzle)
+                        continue
+                    ref_rna = ref_rna_by_index.get(sol_idx)
+                    if ref_rna is None:
+                        logger.error("No reference RNA for solution_%d (puzzle %s); skipping alignment for %s model %d", sol_idx, puzzle, stem, mid)
+                        continue
+
+                    # Solution/reference 侧：split.txt 中的 coords 定义在“原始残基编号”空间，
+                    # 在此转换到对齐使用的逻辑链/残基坐标系中。
+                    ref_coords_orig = coords_by_index.get(sol_idx)
+                    ref_coords = self._coords_orig_to_logical(ref_rna, ref_coords_orig) if ref_coords_orig else None
+                    # Prediction/mobile 侧：直接使用 Puzzles/<puzzle>/index 下的 index（例如 xx.index），
+                    # 其含义已按逻辑链/残基编号定义。
+                    mob_coords = self._prediction_coords_for_alignment(puzzle)
+
+                    # For diagnostics: record which prediction maps to which solution stem
+                    ref_stem = ref_stem_by_index.get(sol_idx, f"solution_{sol_idx}")
+                    logger.info(
+                        "Aligning puzzle=%s submitter=%s model=%d -> solution_%d (%s) coords_ref_orig=%s coords_ref=%s coords_mob=%s",
+                        puzzle,
+                        stem,
+                        mid,
+                        sol_idx,
+                        ref_stem,
+                        ref_coords_orig,
+                        ref_coords,
+                        mob_coords,
+                    )
+
+                    aligned = False
+                    if full_pdb.exists() and ref_rna and pred_rna.exists() and Superimposer is not None and np is not None:
+                        try:
+                            aligned = self._align_and_write(full_pdb, pred_rna, ref_rna, dst, ref_coords=ref_coords, mob_coords=mob_coords)
+                        except Exception as exc:  # pragma: no cover - runtime only
+                            logger.warning("Alignment failed for %s: %s", model_dir, exc)
+
+                    if not aligned:
+                        if not full_pdb.exists():
+                            # Already finalized earlier; leave as-is
+                            continue
+                        # Fallback: just rename to new contract
+                        try:
+                            if dst.exists():
+                                dst.unlink()
+                            shutil.move(str(full_pdb), str(dst))
+                            logger.info("Prediction fallback rename: %s -> %s", full_pdb.name, dst.name)
+                        except Exception as exc:
+                            logger.warning("Failed to move %s to %s: %s", full_pdb, dst, exc)
+                        continue
+
+                    # Alignment succeeded; remove original
+                    try:
+                        if full_pdb.exists():
+                            full_pdb.unlink()
+                    except Exception:
+                        pass
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _prediction_coords_for_alignment(self, puzzle: str) -> Optional[str]:
+        """
+        返回用于 ref/mob 双侧裁剪的 coords 字符串。
+
+        设计为「prediction 侧专用 index」，不做额外兜底：
+        1) 若存在 Puzzles/PZxx/index/xx.index，则使用其中的内容（单行 coords）。
+        2) 否则若 Puzzles/PZxx/index 下只有一个 *.index 文件，则使用该文件内容。
+        3) 否则返回 None（由调用方决定是否仍然对齐）。
+        """
+        index_dir = SCRIPT_ROOT / "Puzzles" / puzzle / "index"
+
+        xx_path = index_dir / "xx.index"
+        if xx_path.exists():
+            return xx_path.read_text().strip()
+
+        index_files = [f for f in index_dir.glob("*.index") if f.is_file()]
+        if len(index_files) == 1:
+            return index_files[0].read_text().strip()
+
+        return None
+
+    def _solution_coords_by_index(self, puzzle: str) -> Dict[int, str]:
+        """
+        Parse split.txt for this puzzle and return solution_i -> coords string (if provided).
+
+        Rows in split.txt:
+          stem <whitespace> coords
+        where coords is a comma-separated list of segments: chain:start:count,...
+        """
+        coords_by_idx: Dict[int, str] = {}
+        split_root = self.cfg.solutions_root
+        if not split_root:
+            logger.error("solutions_root not configured; cannot determine solution coords for %s", puzzle)
+            return coords_by_idx
+        split_file = split_root / puzzle / "split.txt"
+        if not split_file.exists():
+            logger.error("split.txt not found for %s at %s", puzzle, split_file)
+            return coords_by_idx
+        try:
+            for idx, raw in enumerate(split_file.read_text().splitlines()):
+                s = raw.strip()
+                if not s:
+                    continue
+                parts = s.split()
+                if len(parts) >= 2:
+                    coords = parts[1].strip()
+                    if coords:
+                        coords_by_idx[idx] = coords
+        except Exception as exc:
+            logger.error("Failed to read coords from split.txt for %s at %s: %s", puzzle, split_file, exc)
+            return {}
+        return coords_by_idx
+
+    def _find_ref_rna(self, puzzle_dir: Path, ref_stem: str) -> Optional[Path]:
+        """
+        Locate the reference *model* PDB for a solution stem, to be used for RMSD alignment.
+
+        为了避免在 finalize 阶段重命名 model_full.pdb 之后引用失效，这里优先选择
+        每个 model_* 目录下稳定存在的 RNA-only 文件：
+
+          1) rna.pdb                (首选，RNA-only)
+          2) <stem>.pdb             (若已被重命名)
+          3) model_full.pdb         (最后备选，pre-finalize)
+        """
+        stem_dir = puzzle_dir / ref_stem
+        if not stem_dir.is_dir():
+            return None
+        for model_dir in sorted(stem_dir.glob("model_*")):
+            rna = model_dir / "rna.pdb"
+            if rna.exists():
+                return rna
+            stem_pdb = model_dir / f"{ref_stem}.pdb"
+            if stem_pdb.exists():
+                return stem_pdb
+            full = model_dir / "model_full.pdb"
+            if full.exists():
+                return full
+        return None
+
+    def _ordered_solution_stems(self, puzzle: str) -> List[str]:
+        """Return solution stems for this puzzle in solution_i order (0-based)."""
+        stems: List[str] = []
+        # Require split.txt to define solution order explicitly
+        split_root = self.cfg.solutions_root
+        if not split_root:
+            logger.error("solutions_root not configured; cannot determine solution stems for %s", puzzle)
+            return []
+        split_file = (split_root / puzzle / 'split.txt')
+        if not split_file.exists():
+            logger.error("split.txt not found for %s at %s", puzzle, split_file)
+            return []
+        try:
+            for ln in split_file.read_text().splitlines():
+                s = ln.strip()
+                if not s:
+                    continue
+                if "\t" in s:
+                    stem = s.split("\t", 1)[0].strip()
+                elif "," in s:
+                    stem = s.split(",", 1)[0].strip()
+                else:
+                    parts = s.split()
+                    stem = parts[0].strip() if parts else ""
+                if stem:
+                    stems.append(stem)
+        except Exception as exc:
+            logger.error("Failed to read split.txt for %s from %s: %s", puzzle, split_file, exc)
+            return []
+
+        if not stems:
+            logger.error("split.txt for %s (%s) contains no usable solution stems", puzzle, split_file)
+            return []
+
+        # Deduplicate while preserving order (first occurrence wins)
+        seen: Set[str] = set()
+        ordered: List[str] = []
+        for st in stems:
+            if st in seen:
+                continue
+            seen.add(st)
+            ordered.append(st)
+        return ordered
+
+    def _parse_model_id_from_dir(self, name: str) -> int:
+        m = re.search(r"model_(\d+)", name, re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return 1
+        return 1
+
+    def _get_rna_chains(self, pdb_path: Path) -> Set[str]:
+        """Scan PDB file and return set of chain IDs that contain RNA residues.
+
+        Residue type is determined via residues.list so that nucleotide‑like
+        HETATMs (e.g. GTP -> G) are also recognised.
+        """
+        chains: Set[str] = set()
+        # Normalised RNA residue codes after applying residues.list
+        rna_resnames = {"A", "C", "G", "U", "T", "I"}
+        rename_res = self._load_residue_map_from_config()
+        try:
+            for line in pdb_path.read_text().splitlines():
+                rec = line[0:6]
+                if not (rec.startswith("ATOM") or rec.startswith("HETATM")):
+                    continue
+                raw_resn = line[17:20].strip()
+                resn = rename_res.get(raw_resn, raw_resn).upper()
+                if resn not in rna_resnames:
+                    continue
+                chain = line[21].strip()
+                if chain:
+                    chains.add(chain)
+        except Exception:
+            return set()
+        return chains
+
+    def _align_and_write(self, pred_full: Path, pred_rna: Path, ref_rna: Path,
+                         out_path: Path,
+                         ref_coords: Optional[str] = None,
+                         mob_coords: Optional[str] = None) -> bool:
+        if Superimposer is None or np is None:
+            logger.warning("Bio.PDB.Superimposer/numpy not available; cannot align")
+            return False
+
+        # --- 1) 基础设置：参考 / 预测各自的 coords，以及简单链映射 ---
+        # ref_coords: 用于 reference (solution) 侧的残基过滤
+        # mob_coords: 用于 mobile (prediction)  侧的残基过滤
+        # chain_mapping: mobile 链名 -> reference 链名（仅在双方都是单链且链名不同的情况下启用）
+        chain_mapping: Dict[str, str] = {}
+        ref_rna_chains = self._get_rna_chains(ref_rna)
+        mob_rna_chains = self._get_rna_chains(pred_rna)
+        if len(ref_rna_chains) == 1 and len(mob_rna_chains) == 1:
+            ref_chain = next(iter(ref_rna_chains))
+            mob_chain = next(iter(mob_rna_chains))
+            if mob_chain != ref_chain:
+                chain_mapping[mob_chain] = ref_chain
+
+        # --- 2) 收集匹配的主链/重原子坐标 ---
+        ref_pts, mob_pts = self._collect_matched_mainchain_points(
+            ref_rna, pred_rna, coords=ref_coords, mob_coords=mob_coords, chain_mapping=chain_mapping
+        )
+        if ref_pts is None or mob_pts is None or len(ref_pts) < 3:
+            logger.warning("Insufficient matched mainchain atoms for alignment (%d)", 0 if ref_pts is None else len(ref_pts))
+            return False
+
+        ref_arr = np.array(ref_pts, dtype=float)
+        mob_arr = np.array(mob_pts, dtype=float)
+
+        # Bio.PDB.Superimposer 期望的是带 get_coord() 的原子对象列表；
+        # 这里用一个轻量的包装类把坐标数组适配成“原子”。
+        class _CoordAtom:
+            def __init__(self, coord: np.ndarray) -> None:
+                self._coord = np.asarray(coord, dtype=float)
+
+            def get_coord(self) -> np.ndarray:
+                return self._coord
+
+        fixed_atoms = [_CoordAtom(c) for c in ref_arr]
+        moving_atoms = [_CoordAtom(c) for c in mob_arr]
+
+        sup = Superimposer()
+        sup.set_atoms(fixed_atoms, moving_atoms)
+        rot, tran = sup.rotran
+        rms = float(sup.rms)
+        logger.info("Alignment RMSD=%.3f using %d atoms", rms, len(ref_pts))
+
+        # Apply transform to full PDB
+        lines_in = pred_full.read_text().splitlines()
+        lines_out: List[str] = []
+        for line in lines_in:
+            rec = line[0:6]
+            if rec.startswith('ATOM') or rec.startswith('HETATM'):
+                try:
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    v = np.array([x, y, z], dtype=float)
+                    vv = np.dot(v, rot) + tran
+                    x2, y2, z2 = vv.tolist()
+                    # Keep formatting to 8.3f in columns 31-54 (0-based slices [30:38], [38:46], [46:54])
+                    line = f"{line[:30]}{x2:8.3f}{y2:8.3f}{z2:8.3f}{line[54:]}"
+                except Exception:
+                    # Keep original line on failure
+                    pass
+            lines_out.append(line)
+
+        out_path.write_text("\n".join(lines_out) + ("\n" if lines_out and not lines_out[-1].endswith("\n") else ""))
+        return True
+
+    def _collect_matched_mainchain_points(self, ref_rna: Path, mob_rna: Path,
+                                          coords: Optional[str] = None,
+                                          mob_coords: Optional[str] = None,
+                                          chain_mapping: Optional[Dict[str, str]] = None) -> Tuple[Optional[List[List[float]]], Optional[List[List[float]]]]:
+        """
+        使用残基 + 主链/重原子做原子配对，尽量贴近 puzzlesAuto/pdb_utils._collect_atom_pairs：
+
+        - 按 (chain, resi, resn) 对 reference / mobile 两侧残基进行配对；
+        - 同一残基内按 canonical atom name（atoms.list）对原子配对；
+        - 只使用 backbone + heavy 原子；
+        - 若提供 coords（chain:start:count,...），则对两侧都按该片段裁剪残基。
+        """
+        # Use coords for ref if not specified otherwise
+        ref_c = coords
+        # Use mob_coords exactly as provided（prediction 侧单独裁剪）
+        mob_c = mob_coords
+
+        ref_res = self._pdb_residue_atom_map(ref_rna, coords=ref_c)
+        mob_res = self._pdb_residue_atom_map(mob_rna, coords=mob_c)
+
+        if not ref_res or not mob_res:
+            return None, None
+
+        # Apply chain mapping to mob_res keys if provided
+        # This allows matching mobile chain 'B' to reference chain 'C'
+        if chain_mapping:
+            new_mob_res = {}
+            for (ch, resi, resn), atoms in mob_res.items():
+                new_ch = chain_mapping.get(ch, ch)
+                new_mob_res[(new_ch, resi, resn)] = atoms
+            mob_res = new_mob_res
+
+        # residue 对应：公共 (chain, resi, resn)，排序与 puzzlesAuto/pdb_utils.py 中保持一致风格
+        def _sort_key(k: Tuple[str, str, str]) -> Tuple[str, object]:
+            chain, resi, _resn = k
+            # PyMOL 的 resi 可能是字符串（含插入码），这里尽量按数字排序，退化为字符串
+            try:
+                resi_key: object = int(resi)
+            except Exception:
+                resi_key = resi
+            return chain, resi_key
+
+        ref_pts: List[List[float]] = []
+        mob_pts: List[List[float]] = []
+
+        # 默认行为（带 coords 时）：忽略绝对 residue 编号，按残基顺序配对，
+        # 以模拟 index/裁剪后的“从 1 开始”的逻辑编号。
+        # 若没有 coords（极少数 puzzle），退回旧的 key 交集行为。
+        if coords:
+            # 按链 + residue 编号排序打平为列表
+            def _sorted_res_list(res_map: Dict[Tuple[str, str, str], Dict[str, List[float]]]
+                                 ) -> List[Tuple[Tuple[str, str, str], Dict[str, List[float]]]]:
+                items = list(res_map.items())
+                items.sort(key=lambda kv: _sort_key(kv[0]))
+                return items
+
+            ref_list = _sorted_res_list(ref_res)
+            mob_list = _sorted_res_list(mob_res)
+
+            n = min(len(ref_list), len(mob_list))
+            for i in range(n):
+                _ref_key, ref_atoms = ref_list[i]
+                _mob_key, mob_atoms = mob_list[i]
+                common_atoms = sorted(set(ref_atoms.keys()) & set(mob_atoms.keys()))
+                for aname in common_atoms:
+                    ref_pts.append(ref_atoms[aname])
+                    mob_pts.append(mob_atoms[aname])
+        else:
+            # 无 coords 的旧路径：按 (chain, resi, resn) 精确匹配
+            common_keys = sorted(set(ref_res.keys()) & set(mob_res.keys()), key=_sort_key)
+            for key in common_keys:
+                ref_atoms = ref_res[key]
+                mob_atoms = mob_res[key]
+                common_atoms = sorted(set(ref_atoms.keys()) & set(mob_atoms.keys()))
+                for aname in common_atoms:
+                    ref_pts.append(ref_atoms[aname])
+                    mob_pts.append(mob_atoms[aname])
+
+        if len(ref_pts) < 3:
+            return None, None
+
+        return ref_pts, mob_pts
+
+    def _pdb_residue_atom_map(self, path: Path, coords: Optional[str] = None) -> Dict[Tuple[str, str, str], Dict[str, List[float]]]:
+        """
+        解析 RNA‑only PDB，为 RMSD 拟合构建残基 -> 原子坐标表。
+
+        返回:
+          res_dict: dict[(chain, resi, resn)] -> { canonical_atom_name: [x, y, z] }
+
+        行为尽量与 puzzlesAuto/pdb_utils._build_res_dict/_collect_atom_pairs 对齐：
+          - 使用 residues.list 做残基名归一化；
+          - 使用 atoms.list 做原子名归一化，并限定在 backbone+heavy 集合；
+          - 若提供 coords（chain:start:count,...），仅保留落在这些片段内的残基。
+        """
+        rename_res = self._load_residue_map_from_config()
+        rename_atom, allowed_atoms, ignored_atoms = self._load_atom_map_from_config()
+
+        # 读取整文件文本，后续既用于链/残基重命名，也用于逐行解析
+        try:
+            lines = path.read_text().splitlines()
+        except Exception:
+            return {}
+
+        # 在内存中对链 ID 与残基号做“逻辑重命名”：
+        #   1) 按链类型排序（RNA -> DNA -> protein -> other），并重命名为 A/B/C/...；
+        #   2) 对每条链的残基按出现顺序从 1 开始重新编号。
+        chain_map = self._build_chain_renaming_map_from_lines(lines, rename_res)
+        resi_map = self._build_residue_renumber_map_from_lines(lines, chain_map)
+
+        # Optional residue selection based on coords string from split/index:
+        # coords format: "chain:start:count,chain2:start2:count2,..."
+        segments: List[Tuple[str, int, int]] = []
+        if coords:
+            for piece in coords.split(","):
+                piece = piece.strip()
+                if not piece:
+                    continue
+                parts = piece.split(":")
+                if len(parts) != 3:
+                    continue
+                ch = parts[0].strip()
+                try:
+                    start = int(float(parts[1]))
+                    count = int(float(parts[2]))
+                except Exception:
+                    continue
+                if count <= 0:
+                    continue
+                segments.append((ch, start, count))
+
+        def _in_segments(chain: str, resseq: int) -> bool:
+            # 无 coords 时不过滤任何残基
+            if not segments:
+                return True
+            for ch, start, count in segments:
+                if ch and ch != chain:
+                    continue
+                if start <= resseq < start + count:
+                    return True
+            return False
+
+        res_dict: Dict[Tuple[str, str, str], Dict[str, List[float]]] = {}
+
+        try:
+            for line in lines:
+                rec = line[0:6]
+                # 对齐阶段需要同时支持 ATOM 与 nucleotide‑like HETATM
+                if not (rec.startswith("ATOM") or rec.startswith("HETATM")):
+                    continue
+
+                orig_chain = line[21].strip()
+                resseq_str = line[22:26].strip()
+                if not resseq_str:
+                    continue
+                icode = line[26].strip()
+
+                # 先构建原始残基 key，并查出逻辑链 / 逻辑残基号，
+                # coords 过滤在“逻辑坐标系”中进行（例如链 A 的第 1–55 个残基）。
+                orig_resi_key = f"{resseq_str}{icode}".strip() or resseq_str
+                logical_chain = chain_map.get(orig_chain, orig_chain)
+                logical_resi = resi_map.get((orig_chain, orig_resi_key), orig_resi_key)
+
+                try:
+                    logical_resi_int = int(float(logical_resi))
+                except Exception:
+                    continue
+
+                if not _in_segments(logical_chain, logical_resi_int):
+                    continue
+
+                resname = line[17:20].strip()
+                resname = rename_res.get(resname, resname)
+                if not resname:
+                    continue
+
+                atom = line[12:16].strip()
+                atom = rename_atom.get(atom, atom)
+
+                if atom in ignored_atoms:
+                    continue
+                if allowed_atoms and atom not in allowed_atoms:
+                    continue
+
+                try:
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                except Exception:
+                    continue
+
+                key = (logical_chain, logical_resi, resname)
+                bucket = res_dict.setdefault(key, {})
+                # 若同一残基同一 canonical 原子出现多次（多构象），简单覆盖
+                bucket[atom] = [x, y, z]
+        except Exception:
+            return {}
+
+        return res_dict
+
+    def _coords_orig_to_logical(self, pdb_path: Path, coords: Optional[str]) -> Optional[str]:
+        """
+        将基于“原始残基编号”的 coords（chain:start:count,...）转换到
+        对齐使用的“逻辑链 / 逻辑残基号”坐标系中。
+
+        用于 solution 侧：split.txt 中的 A:17:85 等定义在原始 PDB 编号上，
+        对齐阶段则在 normalize 后的链/残基空间中解释。
+        """
+        if not coords:
+            return None
+
+        try:
+            lines = pdb_path.read_text().splitlines()
+        except Exception:
+            # 读取失败时保持原样，不引入额外兜底行为
+            return coords
+
+        rename_res = self._load_residue_map_from_config()
+        chain_map = self._build_chain_renaming_map_from_lines(lines, rename_res)
+        resi_map = self._build_residue_renumber_map_from_lines(lines, chain_map)
+
+        from collections import defaultdict
+        mapped: Dict[str, Set[int]] = defaultdict(set)
+
+        for piece in coords.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            parts = piece.split(":")
+            if len(parts) != 3:
+                continue
+            ch_orig = parts[0].strip()
+            try:
+                start = int(float(parts[1].strip()))
+                count = int(float(parts[2].strip()))
+            except Exception:
+                continue
+            if count <= 0:
+                continue
+
+            for r in range(start, start + count):
+                orig_resi_key = str(r)
+                logical_resi = resi_map.get((ch_orig, orig_resi_key))
+                if not logical_resi:
+                    continue
+                try:
+                    logical_resi_int = int(float(logical_resi))
+                except Exception:
+                    continue
+                logical_chain = chain_map.get(ch_orig, ch_orig)
+                mapped[logical_chain].add(logical_resi_int)
+
+        if not mapped:
+            # 若映射不到任何逻辑残基，保持原 coords，不做隐式放大或缩小
+            return coords
+
+        pieces_out: List[str] = []
+        for logical_chain, resi_set in mapped.items():
+            vals = sorted(resi_set)
+            if not vals:
+                continue
+            start = prev = vals[0]
+            count = 1
+            for v in vals[1:]:
+                if v == prev + 1:
+                    prev = v
+                    count += 1
+                else:
+                    pieces_out.append(f"{logical_chain}:{start}:{count}")
+                    start = prev = v
+                    count = 1
+            pieces_out.append(f"{logical_chain}:{start}:{count}")
+
+        return ",".join(pieces_out)
+
+    # ---- 内存中的链/残基重命名工具 ----
+    _PROTEIN_RESN: Set[str] = {
+        "ALA", "ARG", "ASN", "ASP", "CYS",
+        "GLU", "GLN", "GLY", "HIS", "ILE",
+        "LEU", "LYS", "MET", "PHE", "PRO",
+        "SER", "THR", "TRP", "TYR", "VAL",
+        "SEC", "PYL",
+        "HSD", "HSE", "HSP",
+    }
+
+    def _build_chain_renaming_map_from_lines(self, lines: List[str], rename_res: Dict[str, str]) -> Dict[str, str]:
+        """
+        在内存中分析 PDB 文本，按链类型 (RNA/DNA/protein/other) 排序并重命名为 A/B/C/...
+        返回: { 原始链ID -> 逻辑链ID }。
+        """
+        # 统计每条链的残基类型计数
+        chain_resn_counts: Dict[str, Dict[str, int]] = {}
+        for line in lines:
+            rec = line[0:6]
+            if not (rec.startswith("ATOM") or rec.startswith("HETATM")):
+                continue
+            ch = line[21].strip()
+            resn = line[17:20].strip()
+            bucket = chain_resn_counts.setdefault(ch, {})
+            bucket[resn] = bucket.get(resn, 0) + 1
+
+        if not chain_resn_counts:
+            return {}
+
+        def classify_chain(resn_counts: Dict[str, int]) -> str:
+            protein = dna = rna = 0
+            for resn, count in resn_counts.items():
+                if resn in self._PROTEIN_RESN:
+                    protein += count
+
+                code = rename_res.get(resn)
+                if code in ("A", "C", "G", "U"):
+                    rna += count
+                elif code in ("T", "D"):
+                    dna += count
+
+                if code is None:
+                    if resn in ("A", "C", "G", "U", "I"):
+                        rna += count
+                    elif resn in ("DA", "DC", "DG", "DT", "DI", "T"):
+                        dna += count
+
+            max_score = max(rna, dna, protein)
+            if max_score == 0:
+                return "other"
+            if max_score == rna:
+                return "rna"
+            if max_score == dna:
+                return "dna"
+            if max_score == protein:
+                return "protein"
+            return "other"
+
+        chains = list(chain_resn_counts.keys())
+        type_map: Dict[str, str] = {ch: classify_chain(resn_counts) for ch, resn_counts in chain_resn_counts.items()}
+
+        ordered: List[str] = []
+        for t in ("rna", "dna", "protein", "other"):
+            ordered.extend([ch for ch in chains if type_map.get(ch) == t])
+        for ch in chains:
+            if ch not in ordered:
+                ordered.append(ch)
+
+        chain_chars = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        mapping: Dict[str, str] = {}
+        for i, ch in enumerate(ordered):
+            if i >= len(chain_chars):
+                new_id = chain_chars[-1]
+            else:
+                new_id = chain_chars[i]
+            mapping[ch] = new_id
+        return mapping
+
+    def _build_residue_renumber_map_from_lines(
+        self,
+        lines: List[str],
+        chain_map: Dict[str, str],
+    ) -> Dict[Tuple[str, str], str]:
+        """
+        基于原始 PDB 文本，为每条链构建 (原始链, 原始 resi+icode) -> 新残基号 的映射。
+        """
+        resi_map: Dict[Tuple[str, str], str] = {}
+
+        # 先按原始链分别收集残基出现顺序
+        per_chain_order: Dict[str, List[str]] = {}
+        seen_per_chain: Dict[str, Set[str]] = {}
+
+        for line in lines:
+            rec = line[0:6]
+            if not (rec.startswith("ATOM") or rec.startswith("HETATM")):
+                continue
+            orig_chain = line[21].strip()
+            resseq_str = line[22:26].strip()
+            if not resseq_str:
+                continue
+            icode = line[26].strip()
+            resi_key = f"{resseq_str}{icode}".strip() or resseq_str
+
+            seen = seen_per_chain.setdefault(orig_chain, set())
+            if resi_key in seen:
+                continue
+            seen.add(resi_key)
+            per_chain_order.setdefault(orig_chain, []).append(resi_key)
+
+        for orig_chain, resi_list in per_chain_order.items():
+            next_idx = 1
+            for resi_key in resi_list:
+                resi_map[(orig_chain, resi_key)] = str(next_idx)
+                next_idx += 1
+
+        return resi_map
+
+    def _load_residue_map_from_config(self) -> Dict[str, str]:
+        """
+        解析 bin/config/residues.list:
+          old_resname  new_code
+        new_code 为 '-' 的行忽略。
+        """
+        mapping: Dict[str, str] = {}
+        cfg = SCRIPT_ROOT / "bin" / "config" / "residues.list"
+        if not cfg.exists():
+            return mapping
+        try:
+            for raw in cfg.read_text().splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                old, new = parts[0], parts[1]
+                if new == "-":
+                    continue
+                mapping[old] = new
+        except Exception:
+            return {}
+        return mapping
+
+    def _load_atom_map_from_config(self) -> Tuple[Dict[str, str], Set[str], Set[str]]:
+        """
+        解析 bin/config/atoms.list，获取：
+          - rename_map   : old_atom_name -> canonical_atom_name
+          - allowed_atoms: 参与 RMSD 的原子（backbone + heavy）
+          - ignored_atoms: 显式忽略的原子
+        """
+        rename_map: Dict[str, str] = {}
+        allowed: Set[str] = set()
+        ignored: Set[str] = set()
+
+        cfg = SCRIPT_ROOT / "bin" / "config" / "atoms.list"
+        if not cfg.exists():
+            return rename_map, allowed, ignored
+
+        section: Optional[str] = None  # 'heavy', 'backbone', 'ignore', 'dna', None
+
+        try:
+            for raw in cfg.read_text().splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith("#"):
+                    header = line.lower()
+                    if "heavy" in header:
+                        section = "heavy"
+                    elif "backbone" in header:
+                        section = "backbone"
+                    elif "ignore" in header:
+                        section = "ignore"
+                    elif "non canonical" in header or "noncanonical" in header:
+                        section = "ignore"
+                    elif "dna" in header:
+                        section = "dna"
+                    else:
+                        section = None
+                    continue
+
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                old, new = parts[0], parts[1]
+
+                if section == "dna":
+                    continue
+
+                if new == "-":
+                    ignored.add(old)
+                    continue
+
+                if old != new:
+                    rename_map[old] = new
+
+                if section in ("heavy", "backbone"):
+                    allowed.add(new)
+        except Exception:
+            return {}, set(), set()
+
+        return rename_map, allowed, ignored
+
+    def _split_pdb_into_models(self, pdb_path: Path) -> List[ModelBundle]:
+        text = pdb_path.read_text().splitlines(keepends=True)
+        has_model_cards = any(line.startswith("MODEL") or line.startswith("MODULE") for line in text)
+
+        bundles: List[ModelBundle] = []
+        header_lines: List[str] = []
+        current_lines: List[str] = []
+        current_groups: Dict[Tuple[int, str, str, Optional[int], str, int], ResidueGroup] = {}
+        current_model = 1
+        current_tag = "MODEL"
+        last_residue: Optional[Tuple[str, str, Optional[int], str]] = None
+        occ_counter: Dict[Tuple[str, str, Optional[int], str], int] = defaultdict(int)
+        in_model = False
+
+        def flush_current() -> None:
+            nonlocal current_lines, current_groups, last_residue, occ_counter, header_lines
+            if not current_lines:
+                return
+            bundles.append(ModelBundle(
+                model_id=current_model,
+                model_tag=current_tag,
+                header=list(header_lines),
+                body_lines=list(current_lines),
+                groups=current_groups
+            ))
+            current_lines = []
+            current_groups = {}
+            last_residue = None
+            occ_counter = defaultdict(int)
+            header_lines = []
+            # Enforce max_models limit
+            if self.cfg.max_models and len(bundles) >= self.cfg.max_models:
+                raise StopIteration
+
+        if not has_model_cards:
+            in_model = True
+            current_model = 1
+            current_tag = "MODEL"
+
+        try:
+            for line in text:
+                record = line[0:6].strip()
+                if record in {"MODEL", "MODULE"}:
+                    flush_current()
+                    current_tag = record
+                    current_model = self._parse_model_serial(line)
+                    in_model = True
+                    continue
+                if record == "ENDMDL":
+                    current_lines.append(line)
+                    flush_current()
+                    in_model = False
+                    continue
+
+                if not in_model:
+                    header_lines.append(line)
+                    continue
+
+                current_lines.append(line)
+                if record not in {"ATOM", "HETATM"}:
+                    continue
+
+                resname = line[17:20].strip()
+                chain = line[21].strip()
+                resseq_str = line[22:26].strip()
+                resseq = int(resseq_str) if resseq_str else None
+                icode = line[26].strip()
+                base = (resname, chain, resseq, icode)
+                if base != last_residue:
+                    occ_counter[base] += 1
+                    last_residue = base
+                occ = occ_counter[base]
+                key = (current_model, resname, chain, resseq, icode, occ)
+                group = current_groups.get(key)
+                if group is None:
+                    group = ResidueGroup(current_model, current_tag, resname, chain, resseq, icode, occ, [], None)
+                    current_groups[key] = group
+                group.lines.append(line)
+                if record == "ATOM":
+                    group.has_atom = True
+                elif record == "HETATM":
+                    group.has_hetatm = True
+        except StopIteration:
+            # Reached max_models limit
+            pass
+
+        if current_lines:
+            flush_current()
+
+        if not bundles and header_lines:
+            # Entire file treated as header (no MODEL/MODULE and no ATOM found?)
+            logger.warning("No atom records found in %s", pdb_path)
+        return bundles
+
+    def _parse_model_serial(self, line: str) -> int:
+        match = re.search(r"^(?:MODEL|MODULE)\s+(\d+)", line)
+        if match:
+            return int(match.group(1))
+        snippet = line[10:14].strip()
+        return int(snippet) if snippet.isdigit() else 1
+
+    def _residue_summary(self, group: ResidueGroup) -> Dict[str, object]:
+        return {
+            "resname": group.resname,
+            "chain": group.chain,
+            "resseq": group.resseq,
+            "icode": group.icode,
+            "occurrence": group.occurrence,
+            "metadata": group.info,
+        }
+
+    def _read_tsv_rows(self, path: Path) -> List[Dict[str, object]]:
+        rows: List[Dict[str, object]] = []
+        # Try utf-8 then latin-1 as fallback
+        for enc in ("utf-8", "latin-1"):
+            try:
+                with path.open("r", encoding=enc) as fh:
+                    reader = csv.DictReader(fh, delimiter='\t')
+                    for row in reader:
+                        rows.append(row)
+                break
+            except Exception:
+                rows = []
+                continue
+        return rows
+
+    def _build_binding_pocket_fingerprints(self, tsv_path: Path) -> None:
+        """
+        Aggregate per-residue interaction fingerprints for binding-pocket residues
+        from a per-puzzle summary TSV (…_fingernaat_summary_results.tsv).
+
+        Binding-pocket residues are defined as residues that have at least one
+        interaction in any solution row (is_solution == 1). For each structure
+        (row), and for each such residue, we build a fixed-order 0/1 fingerprint
+        string over the following interaction types:
+            HB, HAL, CA, Pi_Cation, Pi_Anion, Pi_Stacking,
+            Mg_mediated, K_mediated, Na_mediated,
+            Other_mediated, Water_mediated, Lipophilic
+        """
+        if not tsv_path.exists():
+            logger.warning("Binding-pocket TSV source not found: %s", tsv_path)
+            return
+
+        binding_order = [
+            "HB",
+            "HAL",
+            "CA",
+            "Pi_Cation",
+            "Pi_Anion",
+            "Pi_Stacking",
+            "Mg_mediated",
+            "K_mediated",
+            "Na_mediated",
+            "Other_mediated",
+            "Water_mediated",
+            "Lipophilic",
+        ]
+
+        try:
+            with tsv_path.open("r", encoding="utf-8") as fh:
+                reader = csv.reader(fh, delimiter="\t")
+                try:
+                    header = next(reader)
+                except StopIteration:
+                    logger.warning("Empty TSV when building binding-pocket fingerprints: %s", tsv_path)
+                    return
+
+                col_index: Dict[str, int] = {name: idx for idx, name in enumerate(header)}
+                if "is_solution" not in col_index:
+                    logger.warning("TSV %s missing 'is_solution' column; skip binding-pocket fingerprint aggregation", tsv_path)
+                    return
+
+                # Read all rows into memory so we can inspect solution rows first
+                raw_rows: List[List[str]] = []
+                for raw_row in reader:
+                    if not raw_row:
+                        continue
+                    if len(raw_row) < len(header):
+                        raw_row = raw_row + [""] * (len(header) - len(raw_row))
+                    raw_rows.append(raw_row)
+
+                if not raw_rows:
+                    logger.info("No rows in TSV %s; skip binding-pocket fingerprint aggregation", tsv_path)
+                    return
+
+                # Determine solution stem from the first solution row's Source label
+                src_idx = col_index.get("Source")
+                if src_idx is None:
+                    logger.warning("TSV %s missing 'Source' column; skip binding-pocket fingerprint aggregation", tsv_path)
+                    return
+                sol_stem: Optional[str] = None
+                for rr in raw_rows:
+                    raw_flag = rr[col_index["is_solution"]]
+                    try:
+                        is_sol_flag = float(raw_flag) != 0.0
+                    except Exception:
+                        is_sol_flag = str(raw_flag).strip() in {"1", "True", "true"}
+                    if not is_sol_flag:
+                        continue
+                    parts = str(rr[src_idx]).split("|")
+                    if len(parts) >= 2:
+                        sol_stem = Path(parts[1]).stem
+                        break
+
+                if not sol_stem:
+                    logger.info("No solution rows detected in %s; skip binding-pocket fingerprint aggregation", tsv_path)
+                    return
+                # Feature columns follow canonical summary convention:
+                # '<sol_idx>|<pred_idx>#<interaction>', e.g. 'A:21|A:5#HB'.
+                # Group them by residue label (sol|pred) and interaction type.
+                feature_re = re.compile(r"^([^|]+)\|([^#]+)#(.+)$")
+                residue_labels: List[str] = []
+                feature_map: Dict[Tuple[str, str], int] = {}
+                for idx, col in enumerate(header):
+                    m = feature_re.match(str(col))
+                    if not m:
+                        continue
+                    sol_idx = m.group(1)
+                    pred_idx = m.group(2)
+                    interaction = m.group(3)
+                    res_label = f"{sol_idx}|{pred_idx}"
+                    if res_label not in residue_labels:
+                        residue_labels.append(res_label)
+                    feature_map[(res_label, interaction)] = idx
+
+                if not residue_labels or not feature_map:
+                    logger.warning(
+                        "No feature columns found in TSV %s; skip binding-pocket fingerprint aggregation",
+                        tsv_path,
+                    )
+                    return
+
+                # Cache per-row metadata and per-residue fingerprints so we can
+                # decide binding-pocket residues from solution rows before writing.
+                rows_data: List[Tuple[Dict[str, str], Dict[str, str]]] = []
+                binding_residues: Set[str] = set()
+
+                # Keep only core identifiers; drop Score / Ligand_RMSD
+                base_cols = ["Source", "Ligand_name", "is_solution"]
+                base_cols = [c for c in base_cols if c in col_index]
+
+                for raw_row in raw_rows:
+                    meta: Dict[str, str] = {c: raw_row[col_index[c]] for c in base_cols}
+                    raw_flag = meta.get("is_solution", "0")
+                    try:
+                        is_sol_flag = float(raw_flag) != 0.0
+                    except Exception:
+                        is_sol_flag = str(raw_flag).strip() in {"1", "True", "true"}
+
+                    # Aggregate fingerprints per residue label using canonical header columns.
+                    fingerprints: Dict[str, str] = {}
+                    for res_label in residue_labels:
+                        bits: List[str] = []
+                        for interaction in binding_order:
+                            bit_val = "0"
+                            col_idx2 = feature_map.get((res_label, interaction))
+                            if col_idx2 is not None and col_idx2 < len(raw_row):
+                                val = str(raw_row[col_idx2]).strip()
+                                if val:
+                                    try:
+                                        fval = float(val)
+                                        if fval != 0.0:
+                                            bit_val = "1"
+                                    except Exception:
+                                        if val not in ("0", "0.0"):
+                                            bit_val = "1"
+                            bits.append(bit_val)
+                        fp = "".join(bits)
+                        fingerprints[res_label] = fp
+                        if is_sol_flag and "1" in fp:
+                            binding_residues.add(res_label)
+
+                    rows_data.append((meta, fingerprints))
+
+                if not binding_residues:
+                    logger.info("No binding-pocket residues detected in solutions for %s; skip fingerprint export", tsv_path)
+                    return
+                # Preserve canonical residue order as in summary header
+                ordered_binding = [r for r in residue_labels if r in binding_residues]
+                out_path = tsv_path.with_name(tsv_path.stem + "_binding_pocket.tsv")
+                with out_path.open("w", newline="") as out_fh:
+                    writer = csv.writer(out_fh, delimiter="\t")
+                    # First row: true header, columns are residue labels '<sol>|<pred>'
+                    header_row = base_cols + ordered_binding
+                    writer.writerow(header_row)
+                    # Second row: human-readable annotations (solution / prediction)
+                    annot_row = [""] * len(base_cols)
+                    for res_label in ordered_binding:
+                        try:
+                            sol_idx, pred_idx = res_label.split("|", 1)
+                        except ValueError:
+                            sol_idx, pred_idx = res_label, ""
+                        annot_row.append(f"solution={sol_idx} ; prediction={pred_idx}")
+                    writer.writerow(annot_row)
+
+                    for meta, fingerprints in rows_data:
+                        out_row = [meta.get(c, "") for c in base_cols]
+                        for res_label in ordered_binding:
+                            out_row.append(fingerprints.get(res_label, "0" * len(binding_order)))
+                        writer.writerow(out_row)
+                logger.info(
+                    "Binding-pocket fingerprints written to %s (residues=%d, rows=%d)",
+                    out_path,
+                    len(ordered_binding),
+                    len(rows_data),
+                )
+
+                # Also export an Excel version with coloured fingerprints
+                try:
+                    tsv_to_excel.make_excel_from_tsv(
+                        input_tsv=str(out_path),
+                        output_xlsx=str(out_path.with_suffix(".xlsx")),
+                        show_index=True,
+                        fingerprint_start_col=2,
+                        columns_to_remove=["Ligand_name"],
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to export binding-pocket Excel for %s: %s", tsv_path, exc)
+
+        except Exception as exc:
+            logger.warning("Failed to aggregate binding-pocket fingerprints from %s: %s", tsv_path, exc)
+
+    def _load_alignment_table(self, puzzle: str) -> Dict[Tuple[str, int], int]:
+        """
+        Load per-model solution assignment from Puzzles/table/PZxx.csv.
+
+        The table is expected to have at least three columns:
+        - group/submitter column (usually header '0'): maps to step2 submitter name
+        - 'model': integer index (maps to step2 filename suffix and model id)
+        - 'solution': integer solution_i (0-based; negative means no mapping)
+        """
+        mapping: Dict[Tuple[str, int], int] = {}
+        table_path = SCRIPT_ROOT / "Puzzles" / "table" / f"{puzzle}.csv"
+        if not table_path.exists():
+            logger.error("Alignment table not found for %s at %s", puzzle, table_path)
+            return mapping
+        try:
+            with table_path.open("r", newline="") as fh:
+                reader = csv.DictReader(fh)
+                fieldnames = reader.fieldnames or []
+                if not fieldnames:
+                    return mapping
+                # Heuristic: first column is often named '0' (submitter name)
+                group_col = "0" if "0" in fieldnames else fieldnames[0]
+                model_col = "model" if "model" in fieldnames else None
+                sol_col = "solution" if "solution" in fieldnames else None
+                if not model_col or not sol_col:
+                    logger.error("Alignment table %s missing 'model' or 'solution' column; ignoring for %s", table_path, puzzle)
+                    return {}
+                for row in reader:
+                    name = str(row.get(group_col, "")).strip()
+                    model_s = str(row.get(model_col, "")).strip()
+                    sol_s = str(row.get(sol_col, "")).strip()
+                    if not name or not model_s or not sol_s:
+                        continue
+                    try:
+                        model_idx = int(float(model_s))
+                        sol_idx = int(float(sol_s))
+                    except Exception:
+                        continue
+                    if sol_idx < 0:
+                        continue
+                    mapping[(name, model_idx)] = sol_idx
+        except Exception as exc:
+            logger.error("Failed to load alignment table for %s from %s: %s", puzzle, table_path, exc)
+            return {}
+        return mapping
+
+    def _parse_step2_stem(self, puzzle: str, stem: str) -> Tuple[str, Optional[int]]:
+        """
+        Parse PZxx-style step2 filenames into (submitter, index).
+
+        Expected pattern: <puzzle>_<submitter>_<index>, e.g. PZ4_Adamiak_1.
+        Returns (stem, None) if the pattern does not match; this keeps
+        behaviour unchanged for non-step2 or irregular names.
+        """
+        prefix = f"{puzzle}_"
+        if stem.startswith(prefix):
+            rest = stem[len(prefix):]
+            if "_" in rest:
+                submitter, idx_str = rest.rsplit("_", 1)
+                if submitter and idx_str.isdigit():
+                    try:
+                        return submitter, int(idx_str)
+                    except Exception:
+                        pass
+        return stem, None
+
+    # ---------------------
+    # Ligand label loader (CSV: puzzle,label)
+    # ---------------------
+    def _load_ligand_csv(self, path: Path) -> Dict[str, List[Tuple[str, Optional[str], Optional[int], Optional[str]]]]:
+        labels: Dict[str, List[Tuple[str, Optional[str], Optional[int], Optional[str]]]] = defaultdict(list)
+        with path.open("r", newline="") as fh:
+            reader = csv.reader(fh)
+            for row in reader:
+                if not row:
+                    continue
+                # tolerate CRLF + trailing empties
+                row = [str(c).strip() for c in row]
+                if not row[0]:
+                    continue
+                # skip header-like first row
+                if row[0].lower() in {"puzzle", "pz", "puzzles"}:
+                    continue
+                puzzle = row[0]
+                if len(row) == 1:
+                    # no labels on this row
+                    continue
+                # support either 2-column repeated rows or multi-column alias list
+                for col in row[1:]:
+                    label = col.strip()
+                    if not label:
+                        continue
+                    spec = self._parse_label_spec(label)
+                    labels[puzzle].append(spec)
+        return dict(labels)
+
+    def _parse_label_spec(self, label: str) -> Tuple[str, Optional[str], Optional[int], Optional[str]]:
+        # Accept forms: RES, RES:CHAIN, RES:CHAIN:RESSEQ, RES:CHAIN:RESSEQ:ICODE
+        # Also support underscore-separated variants.
+        s = label.strip()
+        if ':' in s:
+            parts = [p.strip() for p in s.split(':')]
+        else:
+            parts = [p.strip() for p in s.split('_')]
+        resname = (parts[0] if parts else s).upper()
+        chain: Optional[str] = None
+        resseq: Optional[int] = None
+        icode: Optional[str] = None
+        if len(parts) >= 2 and parts[1] != "":
+            chain = parts[1] if parts[1] != '_' else ''
+        if len(parts) >= 3 and parts[2] != "":
+            try:
+                resseq = int(float(parts[2]))
+            except Exception:
+                resseq = None
+        if len(parts) >= 4:
+            icode = parts[3]
+        return (resname, chain, resseq, icode)
+
+    def _match_group_with_labels(self, group: ResidueGroup,
+                                 labels: List[Tuple[str, Optional[str], Optional[int], Optional[str]]]) -> bool:
+        for (res, ch, rs, ic) in labels:
+            if res and res != (group.resname or "").upper():
+                continue
+            if ch is not None and ch != group.chain:
+                continue
+            if rs is not None and rs != group.resseq:
+                continue
+            if ic is not None and ic != group.icode:
+                continue
+            return True
+        return False
+
+
+def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
+    parser = argparse.ArgumentParser(description="Run the RNA-ligand fingeRNAt evaluation pipeline")
+    parser.add_argument("--root", required=True, type=Path, help="Root directory containing puzzle subfolders (e.g. 99_emailExtrctPZfiles)")
+    parser.add_argument("--puzzles", nargs="+", required=True, help="Puzzle subdirectories to include (e.g. PZ43 PZ47 PZ49)")
+    parser.add_argument("--ligand-csv", type=Path, help="CSV mapping puzzle,label. Columns: puzzle,label")
+    parser.add_argument("--fingernaat-script", required=True, type=Path, help="Path to the fingeRNAt.py script inside the evaluation environment")
+    parser.add_argument("--python-exec", default="python", help="Python executable to invoke fingeRNAt (default: python)")
+    parser.add_argument("--output-root", type=Path, default=Path("fingernaat_pipeline_outputs"), help="Directory to store prepared models and results")
+    parser.add_argument("--steps", nargs="+", default=["prep", "run", "summarize", "finalize"], help="Pipeline steps to execute (subset of: prep prep_solution run summarize finalize)")
+    parser.add_argument("--overwrite", action="store_true", help="Recreate outputs even if they already exist")
+    parser.add_argument("--dry-run", action="store_true", help="Plan the pipeline without writing files or running commands")
+    parser.add_argument("--no-heatmaps", dest="make_heatmaps", action="store_false", help="Do not generate per‑puzzle TSV + heatmaps in summarize step")
+    parser.add_argument("--solutions-root", type=Path, help="Root directory containing solutions in PZxx subfolders (with split.txt)")
+    parser.add_argument("--fingernaat-detail", dest="fingernaat_detail", action='store_true', help="Pass -detail to fingeRNAt to emit DETAIL_*.tsv files")
+    args = parser.parse_args(argv)
+
+    cfg = PipelineConfig(
+        root=args.root,
+        puzzles=args.puzzles,
+        fingernaat_script=args.fingernaat_script,
+        python_exec=args.python_exec,
+        output_root=args.output_root,
+        steps=args.steps,
+        overwrite=args.overwrite,
+        dry_run=args.dry_run,
+        ligand_csv=args.ligand_csv,
+        make_heatmaps=args.make_heatmaps,
+        solutions_root=args.solutions_root,
+        fingernaat_detail=bool(args.fingernaat_detail),
+    )
+    if (any(s.lower() == "prep" for s in cfg.steps) or any(s.lower() == "prep_solution" for s in cfg.steps)) and not cfg.ligand_csv:
+        parser.error("--ligand-csv is required when running 'prep' or 'prep_solution' steps")
+    return cfg
+
+
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    setup_logging()
+    cfg = parse_args(argv)
+    pipeline = FingernaatPipeline(cfg)
+    pipeline.run()
+
+
+if __name__ == "__main__":
+    main()
